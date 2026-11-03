@@ -72,7 +72,9 @@ services:
     tmpfs:
       - /tmp:size=8m,mode=1777
       - /run:size=8m,mode=0755
-    networks: [monitor, salida]
+    networks:
+      - salida                    # PRIMERA: su gateway es la ruta por defecto (internet)
+      - monitor                   # segunda: solo para que el monitor la alcance
     mem_limit: 32m
     pids_limit: 50
     healthcheck:

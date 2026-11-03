@@ -324,7 +324,10 @@ de Discord sin romper los bloques de código.
 
 Detalles: sin caché de bytecode de Python, sin dependencias externas en el
 monitor, Tinyproxy baja al usuario `nobody` y solo tiene las caps `SETUID`/
-`SETGID`, y ambos contenedores tienen `pids_limit`.
+`SETGID`. Los logs van directos a stdout: si no se define `LogFile`, tinyproxy
+usa `fileno(stdout)` (fd 1), que Docker captura sin abrir fichero (poner
+`LogFile "/dev/stdout"` no funciona: tinyproxy rechaza symlinks al abrir).
+Ambos contenedores tienen `pids_limit`.
 
 ---
 
@@ -366,6 +369,8 @@ ambos sitios).
 | No aparece nada en Discord | Token/canales mal puestos, o el bot no está en el servidor | `docker compose logs pcmonitor` |
 | El proxy no arranca: `Syntax error on line N` en sus logs | Tinyproxy **no admite comentarios al final de línea** en su config | Comentarios siempre en línea propia (formato de `tinyproxy.conf`) |
 | El proxy arranca pero nunca pasa a `(healthy)` | Falta `^tinyproxy\.stats$` en `permitidos`: el healthcheck recibe 403 | Restaurar esa línea en `permitidos` y `docker compose up -d --build proxy` |
+| `Could not open file /dev/stdout` en los logs del proxy | Alguien puso `LogFile "/dev/stdout"` en `tinyproxy.conf`: tinyproxy rechaza symlinks al abrir ficheros | Borrar la línea `LogFile` (sin ella, tinyproxy usa `fileno(stdout)` que sí funciona) |
+| `500 Unable to connect` hacia Discord en los logs del monitor | El proxy no llega a internet: orden de redes o DNS | `docker compose exec proxy ip route` (la ruta por defecto debe salir por `salida`); `docker compose exec proxy nslookup discord.com` |
 | `dependency failed to start` al hacer `up` | Lo anterior: el monitor no arranca si el proxy está caído o unhealthy | `docker compose logs proxy` para ver el motivo real |
 | Las alertas no mencionan | Falta `DISCORD_USER_ID` o el bot no puede mencionarte | Revisa `.env` |
 | `403` en los logs del proxy | Un dominio no permitido (normal si no es Discord) | Es el filtro funcionando |

@@ -4,7 +4,7 @@ services:
     container_name: pcmonitor
     restart: unless-stopped        # arranca solo con el equipo
     network_mode: host             # ve la IP real del equipo, no la del bridge
-    pid: host                      # necesario para apagar el equipo (señal a systemd)
+    pid: host                      # necesario para apagar el equipo y ver los procesos del host
     security_opt:
       - apparmor=unconfined        # el perfil por defecto bloquea señales al PID 1 del host
       - no-new-privileges:true
@@ -14,6 +14,7 @@ services:
     env_file: .env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - /:/host:ro                 # / del host en solo lectura: discos reales, distro y fstab
     mem_limit: 64m
     logging:
       driver: json-file

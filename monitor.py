@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 """Monitor ligero para Debian que escribe en canales de Discord (solo API REST, sin gateway).
 
-Canal de INFORMES (silenciado por ti): IP privada al arrancar, informe periódico.
-Canal de ALERTAS (con notificación):   temperatura alta, apagado, contenedores caídos.
-Solo usa la librería estándar.
+Canal de INFORMES (silenciado por ti), texto plano con bloques de código:
+  - Arranque del equipo con resumen (uptime, sistema, CPU, RAM, Docker).
+  - Aviso cuando cambia la IP privada.
+  - Informe periódico detallado: CPU y top de procesos, RAM/swap, discos por
+    partición real, temperaturas con tendencia y máximas, tráfico de red y
+    ficha completa de cada contenedor (estado, salud, imagen, CPU/RAM, reinicios).
+
+Canal de ALERTAS (con notificación), embeds con color:
+  - Temperatura alta (naranja), apagado térmico y contenedor caído (rojo),
+    recuperación y Docker restablecido (verde).
+  - Cada alerta lleva una instantánea del equipo: temperaturas, carga, RAM,
+    disco y estado de Docker en ese momento.
+
+No consulta ningún servicio externo: todo se lee del propio equipo
+(/proc, /sys y el socket de Docker). Lo único que sale son los mensajes
+a Discord. Solo usa la librería estándar.
 """
 import glob
 import http.client
@@ -22,7 +35,7 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 REPORT_CHANNEL = os.environ["REPORT_CHANNEL_ID"]
 ALERT_CHANNEL = os.environ["ALERT_CHANNEL_ID"]
 MENTION_USER = os.getenv("DISCORD_USER_ID", "")  # opcional: te menciona en las alertas
-REPORT_EVERY = int(os.getenv("REPORT_INTERVAL_MIN", "60")) * 60
+REPORT_EVERY = max(0, int(os.getenv("REPORT_INTERVAL_MIN", "60"))) * 60  # 0 = sin informes
 CHECK_EVERY = int(os.getenv("TEMP_CHECK_SECONDS", "5"))
 DOCKER_CHECK_EVERY = int(os.getenv("DOCKER_CHECK_SECONDS", "30"))
 DOCKER_IGNORE = {n.strip() for n in os.getenv("DOCKER_IGNORE", "").split(",") if n.strip()}
@@ -31,6 +44,17 @@ SHUTDOWN_TEMP = float(os.getenv("SHUTDOWN_TEMP", "80"))
 STRIKES = int(os.getenv("SHUTDOWN_STRIKES", "3"))  # lecturas seguidas >= límite
 SHUTDOWN_METHOD = os.getenv("SHUTDOWN_METHOD", "signal")  # signal | systemctl
 DOCKER_SOCK = os.getenv("DOCKER_SOCK", "/var/run/docker.sock")
+
+# --- presentación -----------------------------------------------------------
+# mixto = informes en texto y alertas en embed | embed = todo embeds | text = todo texto
+MESSAGE_FORMAT = os.getenv("MESSAGE_FORMAT", "mixto").lower()
+DOCKER_STATS = os.getenv("DOCKER_STATS", "1") == "1"  # CPU/RAM/reinicios por contenedor
+TOP_N = int(os.getenv("TOP_PROCESSES", "5"))          # 0 = sin top de procesos
+
+HOST_ROOT = "/host" if os.path.isdir("/host/etc") else "/"  # / real del host, si está montada
+CLK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+NCPU = os.cpu_count() or 1
 HOST = os.uname().nodename
 
 API = "https://discord.com/api/v10"
@@ -39,6 +63,16 @@ HEADERS = {
     "Content-Type": "application/json",
     "User-Agent": "DiscordBot (https://localhost, 1.0)",
 }
+
+C_REPORT = 0x5865F2  # blurple
+C_OK = 0x57F287      # verde
+C_WARN = 0xE67E22    # naranja
+C_ALERT = 0xED4245   # rojo
+ICON = {"running": "🟢", "unhealthy": "🟠"}
+FENCE = "```"
+
+# estado entre ciclos: tendencia y máximas de temperatura, contadores de red
+S = {"temps_prev": None, "temps_max": {}, "net": None}
 
 
 def log(msg):
@@ -70,22 +104,135 @@ def _post(path, payload, timeout=10, retries=3):
     return None
 
 
+def _chunks(text, limit=1990):
+    """Divide texto largo por líneas sin dejar bloques de código abiertos."""
+    if len(text) <= limit:
+        return [text]
+    parts, buf = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:  # línea desproporcionada: trocear a lo bruto
+            if buf:
+                parts.append(buf)
+                buf = ""
+            parts.append(line[:limit])
+            line = line[limit:]
+        if buf and len(buf) + 1 + len(line) > limit:
+            if buf.count(FENCE) % 2:  # dejamos un bloque abierto: cerrarlo
+                buf += "\n" + FENCE
+                line = FENCE + "\n" + line
+            parts.append(buf)
+            buf = line
+        else:
+            buf = f"{buf}\n{line}" if buf else line
+    if buf:
+        parts.append(buf)
+    return parts
+
+
 def send(channel, text, mention=False, timeout=10, retries=3):
-    """Envía un mensaje a un canal. Devuelve True si se entregó."""
-    payload = {"allowed_mentions": {"parse": []}}
-    if mention and MENTION_USER:
-        text = f"<@{MENTION_USER}> {text}"
-        payload["allowed_mentions"] = {"users": [MENTION_USER]}
-    payload["content"] = text[:1990]
-    return _post(f"/channels/{channel}/messages", payload, timeout, retries) is not None
+    """Envía texto (troceado si supera el límite). True si todo llegó."""
+    ok = True
+    limit = 1960 if mention else 1990  # margen para el prefijo de mención
+    for i, part in enumerate(_chunks(text, limit)):
+        payload = {"allowed_mentions": {"parse": []}}
+        if mention and MENTION_USER and i == 0:
+            part = f"<@{MENTION_USER}> {part}"
+            payload["allowed_mentions"] = {"users": [MENTION_USER]}
+        payload["content"] = part[:2000]
+        if _post(f"/channels/{channel}/messages", payload, timeout, retries) is None:
+            ok = False
+    return ok
 
 
-def report(text):
-    return send(REPORT_CHANNEL, text)
+def _field_values(value, limit=1000):
+    """Trocea el valor de un campo de embed por líneas (límite Discord: 1024)."""
+    if len(value) <= limit:
+        return [value]
+    parts, buf = [], ""
+    for line in value.split("\n"):
+        while len(line) > limit:
+            if buf:
+                parts.append(buf)
+                buf = ""
+            parts.append(line[:limit])
+            line = line[limit:]
+        if buf and len(buf) + 1 + len(line) > limit:
+            parts.append(buf)
+            buf = line
+        else:
+            buf = f"{buf}\n{line}" if buf else line
+    if buf:
+        parts.append(buf)
+    return parts
 
 
-def alert(text, timeout=10, retries=3):
-    return send(ALERT_CHANNEL, text, mention=True, timeout=timeout, retries=retries)
+def _pack_embeds(title, desc, color, fields, footer):
+    """Reparte campos en embeds válidos (valor ≤1024, ≤25 campos, ≤6000 chars)."""
+    expanded = []
+    for name, value in fields:
+        pcs = _field_values(value)
+        for i, p in enumerate(pcs):
+            fname = name if len(pcs) == 1 else f"{name} ({i + 1}/{len(pcs)})"
+            expanded.append({"name": fname[:256], "value": p, "inline": False})
+    groups, cur, size = [], [], len(title) + len(desc or "") + 60
+    for fl in expanded:
+        if cur and (size + len(fl["name"]) + len(fl["value"]) > 5600 or len(cur) >= 25):
+            groups.append(cur)
+            cur, size = [], len(title) + 60
+        cur.append(fl)
+        size += len(fl["name"]) + len(fl["value"])
+    if cur or not groups:
+        groups.append(cur)
+    out = []
+    for i, fl in enumerate(groups):
+        e = {"title": (title if i == 0 else f"{title} (cont.)")[:256], "color": color, "fields": fl}
+        if i == 0 and desc:
+            e["description"] = desc[:4096]
+        if i == len(groups) - 1 and footer:
+            e["footer"] = {"text": footer[:2048]}
+        e["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        out.append(e)
+    return out
+
+
+def send_embed(channel, title, desc=None, color=C_REPORT, fields=None,
+               footer=None, mention=False, timeout=10, retries=3):
+    ok = True
+    for i, emb in enumerate(_pack_embeds(title, desc, color, fields or [], footer)):
+        payload = {"embeds": [emb], "allowed_mentions": {"parse": []}}
+        if mention and MENTION_USER and i == 0:
+            payload["content"] = f"<@{MENTION_USER}>"
+            payload["allowed_mentions"] = {"users": [MENTION_USER]}
+        if _post(f"/channels/{channel}/messages", payload, timeout, retries) is None:
+            ok = False
+    return ok
+
+
+def _fence(v):
+    return FENCE + "\n" + v + "\n" + FENCE
+
+
+def send_out(channel, header, desc, sections, color=C_REPORT, is_alert=False,
+             timeout=10, retries=3):
+    """Mensaje compuesto: texto con bloques (informes) o embed con color (alertas)."""
+    sections = [(t, v) for t, v in sections if v and v.strip()]
+    use_embed = MESSAGE_FORMAT == "embed" or (MESSAGE_FORMAT == "mixto" and is_alert)
+    if use_embed:
+        fields = [(t, _fence(v)) for t, v in sections]
+        return send_embed(channel, header, desc, color, fields,
+                          footer=f"{HOST} · monitor", mention=is_alert,
+                          timeout=timeout, retries=retries)
+    parts = [header + (f"\n{desc}" if desc else "")]
+    parts += [f"**{t}**\n{_fence(v)}" for t, v in sections]
+    return send(channel, "\n\n".join(parts), mention=is_alert,
+                timeout=timeout, retries=retries)
+
+
+def notify(header, desc, sections=(), color=C_WARN, timeout=10, retries=3):
+    """Alerta al canal de ALERTAS con mención + instantánea del equipo."""
+    snap = ("Estado del equipo", snapshot(read_temps()))
+    return send_out(ALERT_CHANNEL, header, desc, list(sections) + [snap], color,
+                    is_alert=True, timeout=timeout, retries=retries)
 
 
 # ------------------------------------------------------------ Temperaturas
@@ -107,13 +254,48 @@ def read_temps():
             try:
                 with open(p) as f:
                     t = int(f.read()) / 1000
-                with open(os.path.join(os.path.dirname(p), "name")) as f:
-                    name = f.read().strip()
+                base = os.path.dirname(p)
+                try:
+                    with open(base + "/name") as f:
+                        name = f.read().strip()
+                except OSError:
+                    name = os.path.basename(base)
+                try:  # etiqueta más concreta si existe (p. ej. "Core 0")
+                    with open(p.replace("_input", "_label")) as f:
+                        name += "/" + f.read().strip()
+                except OSError:
+                    pass
                 if 0 < t < 150:
                     temps[f"{name}/{os.path.basename(p)}"] = t
             except (OSError, ValueError):
                 pass
     return temps
+
+
+def fmt_temps(temps, prev=None):
+    """Lista ordenada de más a menos caliente, con tendencia vs la lectura anterior."""
+    if not temps:
+        return "Sin sensores de temperatura"
+    lines = []
+    for k, v in sorted(temps.items(), key=lambda kv: -kv[1]):
+        mark = ""
+        if prev and k in prev:
+            d = v - prev[k]
+            if abs(d) < 0.25:
+                mark = " →"
+            else:
+                mark = f" ▲ +{d:.1f}" if d > 0 else f" ▼ {d:.1f}"
+        lines.append(f"{k}: {v:.1f}°C{mark}")
+    return "\n".join(lines)
+
+
+def maxima_line():
+    """Máximas alcanzadas desde el último informe periódico."""
+    mx = S.get("temps_max") or {}
+    if not mx:
+        return ""
+    items = ", ".join(f"{k} {v:.1f}°" for k, v in sorted(mx.items(), key=lambda kv: -kv[1])[:3])
+    return "\nMáx desde el último informe — " + items
 
 
 # ------------------------------------------------------------------ Docker
@@ -148,19 +330,84 @@ def ct_state(ct):
     return ct["State"]
 
 
-def docker_status():
+def ct_inspect(cid):
+    try:
+        c = _UnixConn(DOCKER_SOCK)
+        c.request("GET", f"/containers/{cid}/json")
+        d = json.load(c.getresponse())
+        c.close()
+        return d
+    except Exception:
+        return None
+
+
+def ct_stats(cid):
+    """(cpu%, ram) de un contenedor en marcha, con una lectura puntual de stats."""
+    try:
+        c = _UnixConn(DOCKER_SOCK)
+        c.request("GET", f"/containers/{cid}/stats?stream=false")
+        s = json.load(c.getresponse())
+        c.close()
+    except Exception:
+        return None, None
+    try:
+        cpu_d = s["cpu_stats"]["cpu_usage"]["total_usage"] - s["precpu_stats"]["cpu_usage"]["total_usage"]
+        sys_d = s["cpu_stats"]["system_cpu_usage"] - s["precpu_stats"]["system_cpu_usage"]
+        ncpu = s["cpu_stats"].get("online_cpus") or len(s["cpu_stats"]["cpu_usage"].get("percpu_usage") or []) or 1
+        cpu = max(0.0, cpu_d / sys_d * ncpu * 100) if sys_d > 0 and cpu_d > 0 else 0.0
+        mem = s["memory_stats"].get("usage", 0) - s["memory_stats"].get("stats", {}).get("cache", 0)
+        return cpu, max(mem, 0)
+    except (KeyError, TypeError, ZeroDivisionError):
+        return None, None
+
+
+def docker_head():
+    """Resumen en una línea, para alertas e instantáneas."""
     try:
         data = docker_list()
-    except Exception as e:
-        return f"⚠️ Docker no accesible ({e})"
+    except Exception:
+        return "no accesible"
     if not data:
-        return "Sin contenedores"
+        return "sin contenedores"
+    n = sum(1 for c in data if ct_state(c) == "running")
+    unh = sum(1 for c in data if ct_state(c) == "unhealthy")
+    extra = f" · {unh} unhealthy" if unh else ""
+    return f"{n}/{len(data)} en marcha{extra}"
+
+
+def docker_section():
+    """Ficha completa. Devuelve (resumen, líneas) o lanza si Docker no responde."""
+    data = docker_list()
+    if not data:
+        return "Sin contenedores", []
     lines = []
     for ct in sorted(data, key=ct_name):
-        st = ct_state(ct)
-        icon = {"running": "🟢", "unhealthy": "🟠"}.get(st, "🔴")
-        lines.append(f"{icon} {ct_name(ct)} — {ct['Status']}")
-    return "\n".join(lines)
+        name, st = ct_name(ct), ct_state(ct)
+        icon = ICON.get(st, "🔴")
+        line = f"{icon} {name} — {ct.get('Status', st)}"
+        img = ct.get("Image", "")
+        if img:
+            line += f"\n      imagen: {img}"
+        if st == "running" and DOCKER_STATS:
+            cpu, ram = ct_stats(ct["Id"])
+            if cpu is not None:
+                line += f"\n      CPU {cpu:.0f}% · RAM {fmt_size(ram)}"
+        if DOCKER_STATS:
+            ins = ct_inspect(ct["Id"])
+            if ins and ins.get("RestartCount"):
+                line += f"\n      reinicios desde la creación: {ins['RestartCount']}"
+        lines.append(line)
+    n_run = sum(1 for c in data if ct_state(c) == "running")
+    n_unh = sum(1 for c in data if ct_state(c) == "unhealthy")
+    n_stop = len(data) - n_run - n_unh
+    head = f"{n_run}/{len(data)} en marcha"
+    if n_unh:
+        head += f" · {n_unh} con salud fallando"
+    if n_stop:
+        head += f" · {n_stop} parado(s)"
+    if DOCKER_IGNORE:
+        head += f"\nIgnorados: {', '.join(sorted(DOCKER_IGNORE))}"
+    return head, lines
 
 
 # ----------------------------------------------------------------- Sistema
@@ -185,38 +432,311 @@ def fmt_uptime(s):
     return f"{s // 86400}d {s % 86400 // 3600}h {s % 3600 // 60}m"
 
 
-def device_status():
-    l1, l5, l15 = os.getloadavg()
-    mem = {}
+def fmt_dur(s):
+    """Duración corta para 'estuvo caído X'."""
+    s = int(s)
+    if s < 3600:
+        return f"{max(s // 60, 1)} min"
+    if s < 86400:
+        return f"{s // 3600} h {s % 3600 // 60} min"
+    return f"{s // 86400} d {s % 86400 // 3600} h"
+
+
+def fmt_size(n):
+    """Bytes → texto corto: 512 B, 12.3 MB, 4.5 GB..."""
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or u == "TB":
+            return f"{n:.0f} {u}" if u in ("B", "KB") else f"{n:.1f} {u}"
+        n /= 1024
+
+
+def distro_name():
+    try:
+        with open(os.path.join(HOST_ROOT, "etc/os-release")) as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return None
+
+
+def cpu_model():
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.lower().startswith("model name") and ":" in line:
+                    return line.split(":", 1)[1].strip()
+            f.seek(0)
+            for line in f:  # ARM/RISC-V: "model" o "Hardware"
+                if line.lower().startswith(("model", "hardware")) and ":" in line:
+                    v = line.split(":", 1)[1].strip()
+                    if v and not v.replace(".", "").isdigit():
+                        return v
+    except OSError:
+        pass
+    try:  # SBC tipo Raspberry: árbol de dispositivos
+        with open("/proc/device-tree/model") as f:
+            return f.read().replace("\x00", "").strip() or None
+    except OSError:
+        return None
+
+
+def mem_info():
+    m = {}
     with open("/proc/meminfo") as f:
         for line in f:
-            if line.startswith(("MemTotal", "MemAvailable")):
+            try:
                 k, v = line.split(":", 1)
-                mem[k] = int(v.split()[0])
-    total = mem["MemTotal"] / 1048576
-    used = total - mem["MemAvailable"] / 1048576
-    d = shutil.disk_usage("/")
-    return (
-        f"Uptime: {fmt_uptime(uptime_secs())}\n"
-        f"Carga: {l1:.2f} {l5:.2f} {l15:.2f}\n"
-        f"RAM: {used:.1f}/{total:.1f} GB\n"
-        f"Disco: {d.used / 1e9:.1f}/{d.total / 1e9:.1f} GB ({d.used * 100 // d.total}%)"
-    )
+                m[k] = int(v.split()[0]) * 1024
+            except (ValueError, IndexError):
+                continue
+    total = m.get("MemTotal", 0)
+    cache = m.get("Cached", 0) + m.get("SReclaimable", 0) - m.get("Shmem", 0)
+    swap_t = m.get("SwapTotal", 0)
+    return {
+        "total": total,
+        "used": total - m.get("MemAvailable", 0),
+        "avail": m.get("MemAvailable", 0),
+        "cache": max(cache, 0),
+        "swap_t": swap_t,
+        "swap_u": max(swap_t - m.get("SwapFree", 0), 0),
+    }
 
 
-def fmt_temps(temps):
-    if not temps:
-        return "Sin sensores de temperatura"
-    return "\n".join(f"{k}: {v:.0f}°C" for k, v in temps.items())
+def mem_section():
+    mem = mem_info()
+    lines = [f"RAM: {fmt_size(mem['used'])} / {fmt_size(mem['total'])} "
+             f"({mem['used'] * 100 // max(mem['total'], 1)}%)"
+             f" · libre {fmt_size(mem['avail'])} · caché {fmt_size(mem['cache'])}"]
+    if mem["swap_t"]:
+        lines.append(f"Swap: {fmt_size(mem['swap_u'])} / {fmt_size(mem['swap_t'])} "
+                     f"({mem['swap_u'] * 100 // max(mem['swap_t'], 1)})")
+    return "\n".join(lines)
 
 
+def _cpu_lines():
+    out = []
+    with open("/proc/stat") as f:
+        for line in f:
+            if line.startswith("cpu"):
+                p = line.split()
+                try:
+                    vals = [int(x) for x in p[1:]]
+                except ValueError:
+                    continue
+                idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                out.append((p[0], sum(vals), sum(vals) - idle))
+    return out
+
+
+def snap_procs():
+    """{pid: (nombre, ticks_cpu, rss_bytes)} de los procesos visibles."""
+    out = {}
+    for p in glob.glob("/proc/[0-9]*"):
+        try:
+            with open(p + "/stat", "rb") as f:
+                s = f.read().decode("utf-8", "replace")
+            r = s.rindex(")")
+            name = s[s.index("(") + 1:r][:15]
+            fld = s[r + 2:].split()
+            ticks = int(fld[11]) + int(fld[12])
+            try:
+                with open(p + "/statm") as f:
+                    rss = int(f.read().split()[1]) * PAGE
+            except (OSError, ValueError, IndexError):
+                rss = 0
+            out[int(p.rsplit("/", 1)[1])] = (name, ticks, rss)
+        except (OSError, ValueError, IndexError):
+            pass
+    return out
+
+
+def sample_cpu(dt=1.0):
+    """Uso de CPU total y por núcleo + tops de procesos, muestreando dt segundos."""
+    a, pa = _cpu_lines(), snap_procs()
+    time.sleep(dt)
+    b, pb = _cpu_lines(), snap_procs()
+
+    def pct(i):
+        tot = b[i][1] - a[i][1]
+        busy = b[i][2] - a[i][2]
+        return max(0.0, min(100.0, 100.0 * busy / tot)) if tot > 0 else 0.0
+
+    cpu = pct(0)
+    cores = [pct(i) for i in range(1, len(a))] if len(a) > 1 else []
+    rows = []
+    for pid, (name, ticks, rss) in pb.items():
+        if pid in pa:
+            dc = (ticks - pa[pid][1]) / (dt * CLK) * 100
+            rows.append((name, max(0.0, dc), rss))
+    top_cpu = sorted([r for r in rows if r[1] >= 1.0], key=lambda r: -r[1])[:TOP_N]
+    top_ram = sorted([r for r in rows if r[2] > 0], key=lambda r: -r[2])[:TOP_N]
+    return cpu, cores, top_cpu, top_ram, len(pb)
+
+
+def disk_list():
+    """Montajes reales del host: {'/montaje': disk_usage}. Necesita /:/host:ro."""
+    base = HOST_ROOT
+    cands = {"/"}
+    try:  # montajes declarados en el fstab del host
+        with open(os.path.join(base, "etc/fstab")) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    p = line.split()
+                    if len(p) >= 2 and p[1].startswith("/"):
+                        cands.add(p[1].rstrip("/") or "/")
+    except OSError:
+        pass
+    try:  # carpetas de primer nivel (detecta montajes por st_dev distinto)
+        for e in os.scandir(base):
+            if e.is_dir():
+                cands.add("/" + e.name)
+    except OSError:
+        pass
+    skip = {"/proc", "/sys", "/dev", "/run", "/snap", "/boot/efi", "/efi", "/tmp", "/var/tmp"}
+    out, devs, root_dev = {}, set(), os.stat(base).st_dev
+    for m in sorted(cands, key=len):
+        if m in skip:
+            continue
+        path = base if m == "/" else base + m
+        try:
+            st = os.stat(path)
+            if m != "/" and st.st_dev == root_dev:
+                continue  # mismo fs que /: no es montaje aparte
+            if st.st_dev in devs:
+                continue  # mismo fs ya mostrado
+            d = shutil.disk_usage(path)
+            if d.total < (1 << 28):  # <256 MB: ruido
+                continue
+            devs.add(st.st_dev)
+            out[m] = d
+        except OSError:
+            continue
+    return out
+
+
+def disk_section():
+    rows = list(disk_list().items())
+    if not rows:
+        return "Sin datos de disco"
+    rows.sort(key=lambda md: -(md[1].used * 100 // md[1].total))
+    return "\n".join(f"{m}: {fmt_size(d.used)} / {fmt_size(d.total)} ({d.used * 100 // d.total}%)"
+                     for m, d in rows)
+
+
+def net_counters():
+    out = {}
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f.readlines()[2:]:
+                if ":" not in line:
+                    continue
+                name, rest = line.split(":", 1)
+                c = rest.split()
+                out[name.strip()] = (int(c[0]), int(c[8]))
+    except (OSError, ValueError, IndexError):
+        return {}
+    return out
+
+
+def net_section():
+    cur = net_counters()
+    prev = S.get("net")
+    S["net"] = cur
+    ifaces = [(k, v) for k, v in cur.items()
+              if k != "lo" and not k.startswith("veth") and (v[0] or v[1])]
+    if not ifaces:
+        return ""
+    lines = [f"Total desde el arranque: ↓{fmt_size(sum(v[0] for _, v in ifaces))} · "
+             f"↑{fmt_size(sum(v[1] for _, v in ifaces))}"]
+    if prev:
+        keys = cur.keys() & prev.keys()
+        drx = max(0, sum(cur[k][0] - prev[k][0] for k in keys))
+        dtx = max(0, sum(cur[k][1] - prev[k][1] for k in keys))
+        lines.append(f"Desde el último informe: ↓{fmt_size(drx)} · ↑{fmt_size(dtx)}")
+    for k, v in sorted(ifaces, key=lambda kv: -(kv[1][0] + kv[1][1]))[:4]:
+        lines.append(f"{k}: ↓{fmt_size(v[0])} · ↑{fmt_size(v[1])}")
+    return "\n".join(lines)
+
+
+def equipo_section():
+    l1, l5, l15 = os.getloadavg()
+    return (f"Uptime: {fmt_uptime(uptime_secs())}\n"
+            f"Sistema: {distro_name() or 'desconocido'} · kernel {os.uname().release} · {os.uname().machine}\n"
+            f"Carga (1/5/15 min): {l1:.2f} {l5:.2f} {l15:.2f}")
+
+
+def snapshot(temps):
+    """Instantánea compacta del equipo, adjunta a todas las alertas."""
+    mem = mem_info()
+    l1, l5, l15 = os.getloadavg()
+    lines = [f"Uptime: {fmt_uptime(uptime_secs())}",
+             f"RAM: {fmt_size(mem['used'])} / {fmt_size(mem['total'])} "
+             f"({mem['used'] * 100 // max(mem['total'], 1)}%)"]
+    if mem["swap_t"]:
+        lines.append(f"Swap en uso: {fmt_size(mem['swap_u'])}")
+    lines.append(f"Carga: {l1:.2f} {l5:.2f} {l15:.2f}")
+    hot = max(temps.values()) if temps else None
+    if hot is not None:
+        lines.append(f"Temp máx: {hot:.1f}°C")
+    d = disk_list().get("/")
+    if d:
+        lines.append(f"Disco /: {fmt_size(d.used)} / {fmt_size(d.total)} ({d.used * 100 // d.total}%)")
+    lines.append(f"Docker: {docker_head()}")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------- Mensajes compuestos
 def build_report(temps):
-    return (
-        f"📊 **{HOST}** — IP privada: `{local_ip() or 'sin red'}`\n"
-        f"**Temperaturas**\n```\n{fmt_temps(temps)}\n```"
-        f"**Equipo**\n```\n{device_status()}\n```"
-        f"**Docker**\n{docker_status()}"
-    )
+    """(cabecera, desc, secciones) del informe periódico detallado."""
+    cpu, cores, top_cpu, top_ram, nproc = sample_cpu(1.0)
+    l1, l5, l15 = os.getloadavg()
+    desc = f"IP privada: `{local_ip() or 'sin red'}`"
+
+    secs = [("Equipo", equipo_section())]
+
+    cpu_lines = [f"Modelo: {cpu_model() or 'desconocida'} ({NCPU} núcleos)",
+                 f"Uso total: {cpu:.1f}% · carga {l1:.2f} {l5:.2f} {l15:.2f}"]
+    if 1 < len(cores) <= 12:
+        cpu_lines.append("Por núcleo: " + " ".join(f"{c:.0f}%" for c in cores))
+    if TOP_N:
+        if top_cpu:
+            cpu_lines.append("Top CPU: " + " · ".join(f"{n} {c:.0f}%" for n, c, _ in top_cpu))
+        if top_ram:
+            total = mem_info()["total"]
+            cpu_lines.append("Top RAM: " + " · ".join(
+                f"{n} {fmt_size(r)} ({r * 100 // max(total, 1)}%)" for n, _, r in top_ram))
+    cpu_lines.append(f"{nproc} procesos visibles")
+    secs.append(("CPU y procesos", "\n".join(cpu_lines)))
+
+    secs.append(("Memoria", mem_section()))
+    secs.append(("Discos", disk_section()))
+    secs.append(("Temperaturas", fmt_temps(temps, S.get("temps_prev")) + maxima_line()))
+    red = net_section()
+    if red:
+        secs.append(("Red", red))
+    try:
+        head, lines = docker_section()
+        secs.append(("Docker", head + ("\n" + "\n".join(lines) if lines else "")))
+    except Exception as e:
+        secs.append(("Docker", f"no accesible ({e})"))
+    return f"📊 {HOST} — informe periódico", desc, secs
+
+
+def build_boot(kind):
+    """(cabecera, desc, secciones) del mensaje de arranque."""
+    secs = [("Equipo", equipo_section() + f"\nCPU: {cpu_model() or '?'} ({NCPU} núcleos)"),
+            ("Docker", docker_head())]
+    return (f"🖥️ {HOST} iniciado ({kind})",
+            f"IP privada: `{local_ip() or 'sin red'}`", secs)
+
+
+def build_ip_change(old, new):
+    return (f"🔄 {HOST} cambió de IP privada", f"`{old or '?'}` → `{new}`",
+            [("Equipo", f"Uptime: {fmt_uptime(uptime_secs())}")])
 
 
 # ----------------------------------------------------------------- Apagado
@@ -241,45 +761,57 @@ def poweroff():
 def check_containers(seen, down, state):
     """Compara con la lectura anterior y manda alertas. Devuelve el nuevo `seen`."""
     try:
-        cts = {ct_name(c): ct_state(c) for c in docker_list() if ct_name(c) not in DOCKER_IGNORE}
-        if state["docker_err"]:
-            state["docker_err"] = False
-            alert(f"✅ **{HOST}**: Docker vuelve a estar accesible")
+        cts = {}
+        for c in docker_list():
+            n = ct_name(c)
+            if n not in DOCKER_IGNORE:
+                cts[n] = {"state": ct_state(c), "img": c.get("Image", "")}
     except Exception as e:
         if not state["docker_err"]:
             state["docker_err"] = True
-            alert(f"⚠️ **{HOST}**: Docker no accesible ({e})")
+            notify(f"⚠️ {HOST} — Docker no accesible", str(e)[:300], [], color=C_WARN)
         return seen
+    if state["docker_err"]:
+        state["docker_err"] = False
+        n_run = sum(1 for v in cts.values() if v["state"] == "running")
+        notify(f"✅ {HOST} — Docker vuelve a estar accesible",
+               f"{n_run}/{len(cts)} contenedores en marcha", [], color=C_OK)
 
-    for name, st in cts.items():
+    for name, info in cts.items():
+        st = info["state"]
         prev = seen.get(name)
-        if st != "running" and prev == "running" and name not in down:
-            down[name] = st
+        if st != "running" and prev and prev["state"] == "running" and name not in down:
+            down[name] = {"t": time.time()}
             icon = "🟠" if st == "unhealthy" else "🔴"
-            alert(f"{icon} **{HOST}**: contenedor `{name}` caído (estado: {st})")
+            notify(f"{icon} {HOST} — contenedor caído",
+                   f"`{name}` — estado: **{st}**\nImagen: `{info['img'] or '?'}`",
+                   [], color=C_ALERT if st != "unhealthy" else C_WARN)
         elif st == "running" and name in down:
-            del down[name]
-            alert(f"✅ **{HOST}**: contenedor `{name}` vuelve a estar en marcha")
+            d = down.pop(name)
+            notify(f"✅ {HOST} — contenedor recuperado",
+                   f"`{name}` está en marcha de nuevo (estuvo caído {fmt_dur(time.time() - d['t'])})",
+                   [], color=C_OK)
 
     for name, prev in seen.items():
-        if name not in cts and prev == "running" and name not in down:
-            down[name] = "eliminado"
-            alert(f"🔴 **{HOST}**: contenedor `{name}` ha desaparecido (eliminado)")
-
+        if name not in cts and prev["state"] == "running" and name not in down:
+            down[name] = {"t": time.time()}
+            notify(f"🔴 {HOST} — contenedor eliminado",
+                   f"`{name}` ha desaparecido de Docker (estaba en marcha)", [], color=C_ALERT)
     return cts
 
 
 # -------------------------------------------------------------------- Main
 def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    log(f"Iniciado. Aviso {WARN_TEMP}°C, apagado {SHUTDOWN_TEMP}°C, informe cada {REPORT_EVERY // 60} min")
+    extra = f"informe cada {REPORT_EVERY // 60} min" if REPORT_EVERY else "sin informe periódico"
+    log(f"Iniciado. Aviso {WARN_TEMP}°C, apagado {SHUTDOWN_TEMP}°C, {extra}, formato {MESSAGE_FORMAT}")
 
     boot_pending = True
     last_ip = None
     next_boot_try = 0
     next_ip_check = 0
     next_docker = 0
-    next_report = time.monotonic() + REPORT_EVERY
+    next_report = time.monotonic() + REPORT_EVERY if REPORT_EVERY else float("inf")
     warned_at = -1e9
     hot = 0
     seen, down, state = {}, {}, {"docker_err": False}
@@ -289,19 +821,29 @@ def main():
         temps = read_temps()
         hottest = max(temps.values()) if temps else None
 
+        for k, v in temps.items():  # máxima de cada zona desde el último informe
+            if v > S["temps_max"].get(k, 0):
+                S["temps_max"][k] = v
+
         # --- protección térmica (siempre lo primero)
         if hottest is not None:
             hot = hot + 1 if hottest >= SHUTDOWN_TEMP else 0
             if hot >= STRIKES:
-                log(f"{hottest:.0f}°C >= {SHUTDOWN_TEMP}°C: apagando")
-                alert(f"🔥 **{HOST}** a {hottest:.0f}°C (límite {SHUTDOWN_TEMP:.0f}°C). **Apagando el equipo.**\n"
-                      f"```\n{fmt_temps(temps)}\n```", timeout=5, retries=1)
+                log(f"{hottest:.1f}°C >= {SHUTDOWN_TEMP:.0f}°C: apagando")
+                notify(f"🔥 {HOST} — APAGADO TÉRMICO",
+                       f"**{hottest:.1f}°C** ≥ {SHUTDOWN_TEMP:.0f}°C en {STRIKES} lecturas "
+                       f"seguidas. Apagando el equipo.",
+                       [("Temperaturas", fmt_temps(temps))],
+                       color=C_ALERT, timeout=5, retries=1)
                 poweroff()
                 time.sleep(120)
                 hot = 0
             elif hottest >= WARN_TEMP and now - warned_at > 600:
                 warned_at = now
-                alert(f"⚠️ **{HOST}** a {hottest:.0f}°C (aviso {WARN_TEMP:.0f}°C, apagado {SHUTDOWN_TEMP:.0f}°C)")
+                notify(f"⚠️ {HOST} — temperatura alta",
+                       f"**{hottest:.1f}°C** ahora mismo "
+                       f"(aviso {WARN_TEMP:.0f}°C · apagado {SHUTDOWN_TEMP:.0f}°C)",
+                       [("Temperaturas", fmt_temps(temps, S.get("temps_prev")))], color=C_WARN)
 
         # --- contenedores caídos
         if now >= next_docker:
@@ -314,7 +856,10 @@ def main():
             ok = False
             if ip:
                 kind = "arranque del equipo" if uptime_secs() < 300 else "reinicio del servicio"
-                ok = report(f"🖥️ **{HOST}** iniciado ({kind})\nIP privada: `{ip}`")
+                try:
+                    ok = send_out(REPORT_CHANNEL, *build_boot(kind))
+                except Exception as e:
+                    log(f"Error en el mensaje de arranque: {e}")
             if ok:
                 boot_pending = False
                 last_ip = ip
@@ -326,14 +871,19 @@ def main():
             next_ip_check = now + 60
             ip = local_ip()
             if ip and ip != last_ip:
-                if report(f"🔄 **{HOST}** cambió de IP privada: `{last_ip}` → `{ip}`"):
+                if send_out(REPORT_CHANNEL, *build_ip_change(last_ip, ip)):
                     last_ip = ip
 
         # --- informe periódico
         if now >= next_report:
             next_report = now + REPORT_EVERY
-            report(build_report(temps))
+            try:
+                send_out(REPORT_CHANNEL, *build_report(temps))
+                S["temps_max"] = {}  # reinicia las máximas del periodo
+            except Exception as e:
+                log(f"Error generando el informe: {e}")
 
+        S["temps_prev"] = temps
         time.sleep(CHECK_EVERY)
 
 

@@ -1,23 +1,89 @@
+# ============================================================================
+#  Monitor de PC — avisos en Discord con salida de red RESTRINGIDA
+# ============================================================================
+#  El contenedor del monitor NO tiene internet: vive en una red interna de
+#  Docker (internal: true) y su única vía de salida es un proxy Squid que
+#  solo deja pasar HTTPS hacia *.discord.com (ver squid.conf). El proxy no
+#  publica ningún puerto: solo lo alcanza el monitor por la red interna.
+# ============================================================================
+
 services:
   pcmonitor:
     build: .
     container_name: pcmonitor
     restart: unless-stopped        # arranca solo con el equipo
-    network_mode: host             # ve la IP real del equipo, no la del bridge
-    pid: host                      # necesario para apagar el equipo y ver los procesos del host
+    pid: host                      # temperaturas y procesos del host + apagado térmico
     security_opt:
       - apparmor=unconfined        # el perfil por defecto bloquea señales al PID 1 del host
       - no-new-privileges:true
     cap_drop: [ALL]
-    cap_add: [KILL]
-    read_only: true
+    cap_add: [KILL]                # solo lo justo: SIGRTMIN+4 a systemd al apagar
+    read_only: true                # sistema de archivos inmutable
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      # Única vía de salida: el proxy interno (solo *.discord.com:443)
+      - HTTPS_PROXY=http://proxy:3128
+      - PYTHONDONTWRITEBYTECODE=1
     env_file: .env
+    depends_on:
+      proxy:
+        condition: service_healthy
+    networks: [monitor]
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /:/host:ro                 # / del host en solo lectura: discos reales, distro y fstab
+      - /var/run/docker.sock:/var/run/docker.sock   # estado de contenedores
+      - /:/host:ro                                  # discos reales, distro, fstab y /proc del host
     mem_limit: 64m
     logging:
       driver: json-file
       options:
         max-size: "1m"
         max-file: "2"
+
+  # ------------------------------------------------------------------
+  #  Proxy de salida (Squid): el ÚNICO contenedor con internet. Solo
+  #  acepta al monitor y solo deja pasar HTTPS a los dominios de Discord.
+  # ------------------------------------------------------------------
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    container_name: pcmonitor-proxy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, DAC_OVERRIDE]  # lo mínimo para bajar al usuario "proxy"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /var/log/squid:size=16m,mode=0755,uid=13,gid=13
+      - /var/spool/squid:size=32m,mode=0755,uid=13,gid=13
+    networks: [monitor, salida]
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 4 bash -c '</dev/tcp/127.0.0.1/3128'"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+
+# ---------------------------------------------------------------------------
+#  monitor : red aislada SIN salida a internet (internal: true).
+#            Subred fija: squid.conf solo admite clientes de 172.30.101.0/24.
+#            Si esta subred choca con tu red o con otras redes Docker, cámbiala
+#            AQUÍ y en la ACL "cliente" de squid.conf (misma en ambos sitios).
+#  salida  : bridge normal con internet; solo lo usa el proxy.
+# ---------------------------------------------------------------------------
+networks:
+  monitor:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.101.0/24
+  salida: {}

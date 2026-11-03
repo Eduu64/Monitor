@@ -1,0 +1,9 @@
+# Proxy de salida: squid de los repos oficiales de Debian y nada más.
+# `squid -N` corre en primer plano (PID 1) y él mismo baja privilegios al
+# usuario "proxy". Solo tunela HTTPS: no necesita caché, logs en disco ni CA.
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends squid \
+ && rm -rf /var/lib/apt/lists/*
+COPY squid.conf /etc/squid/squid.conf
+CMD ["squid", "-N", "-f", "/etc/squid/squid.conf"]

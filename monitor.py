@@ -14,12 +14,15 @@ Canal de ALERTAS (con notificación), embeds con color:
   - Cada alerta lleva una instantánea del equipo: temperaturas, carga, RAM,
     disco y estado de Docker en ese momento.
 
-No consulta ningún servicio externo: todo se lee del propio equipo
-(/proc, /sys y el socket de Docker). Lo único que sale son los mensajes
-a Discord. Solo usa la librería estándar.
+No consulta ningún servicio externo: todo se lee del propio equipo (/proc,
+/sys, el socket de Docker y el /proc del PID 1 del host para la red). Lo
+único que sale son los mensajes a Discord, y solo pueden salir por el proxy
+interno del compose (HTTPS_PROXY → squid con lista de dominios). Solo usa
+la librería estándar.
 """
 import glob
 import http.client
+import ipaddress
 import json
 import os
 import shutil
@@ -55,7 +58,25 @@ HOST_ROOT = "/host" if os.path.isdir("/host/etc") else "/"  # / real del host, s
 CLK = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
 NCPU = os.cpu_count() or 1
-HOST = os.uname().nodename
+
+
+def host_hostname():
+    """Nombre real del equipo: /etc/hostname del host si está montado.
+
+    Dentro del contenedor uname() daría el nombre del contenedor, no el del
+    servidor; /host/etc/hostname es el del propio Debian.
+    """
+    try:
+        with open(os.path.join(HOST_ROOT, "etc/hostname")) as f:
+            n = f.read().strip()
+            if n:
+                return n
+    except OSError:
+        pass
+    return os.uname().nodename
+
+
+HOST = host_hostname()
 
 API = "https://discord.com/api/v10"
 HEADERS = {
@@ -63,6 +84,13 @@ HEADERS = {
     "Content-Type": "application/json",
     "User-Agent": "DiscordBot (https://localhost, 1.0)",
 }
+
+# Salida HTTP solo por el proxy de egreso (compose: squid interno que filtra
+# por dominio). Sin HTTPS_PROXY funciona normal, útil si lo ejecutas directo
+# en Debian en vez de en Docker.
+PROXY = os.getenv("HTTPS_PROXY", "")
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler(
+    {"https": PROXY} if PROXY else None))
 
 C_REPORT = 0x5865F2  # blurple
 C_OK = 0x57F287      # verde
@@ -85,7 +113,7 @@ def _post(path, payload, timeout=10, retries=3):
     for _ in range(retries):
         req = urllib.request.Request(API + path, data=data, headers=HEADERS, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with OPENER.open(req, timeout=timeout) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
             body = e.read()
@@ -411,15 +439,77 @@ def docker_section():
 
 
 # ----------------------------------------------------------------- Sistema
-def local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def _abrir_proc1(nombre):
+    """Abre un fichero del /proc del PID 1 del host: la red REAL del equipo.
+
+    El contenedor va en una red interna de Docker, así que su propia pila de
+    red no vale; con pid: host y /host montado, /proc/1 refleja la del
+    servidor. Si /proc/1 no está accesible, cae al /proc propio.
+    """
+    for p in (os.path.join(HOST_ROOT, "proc/1", nombre), "/proc/" + nombre):
+        try:
+            return open(p)
+        except OSError:
+            continue
+    return None
+
+
+def _hex_ip(h):
+    """IP en hex little-endian de /proc/net/route → '192.168.1.5'."""
     try:
-        s.connect(("8.8.8.8", 80))  # UDP: no envía nada, solo elige ruta
-        return s.getsockname()[0]
-    except OSError:
+        return socket.inet_ntoa(bytes.fromhex(h)[::-1])
+    except (ValueError, TypeError):
         return None
-    finally:
-        s.close()
+
+
+def host_ips():
+    """IPs privadas (IPv4) del equipo, sin tocar la red ni mandar un paquete.
+
+    Prefiere las IPs de las interfaces con ruta por defecto (la LAN real);
+    si no hay, devuelve todas las locales no loopback. [] = sin red.
+    """
+    filas, ifaces_def, subs = [], set(), []
+    f = _abrir_proc1("net/route")
+    if f:
+        with f:
+            filas = [l.split() for l in f.readlines()[1:]]
+        for p in filas:  # 1ª pasada: interfaces con puerta de enlace
+            if len(p) < 8:
+                continue
+            dest, gw, mask = _hex_ip(p[1]), _hex_ip(p[2]), _hex_ip(p[7])
+            if dest == "0.0.0.0" and mask == "0.0.0.0" and gw not in (None, "0.0.0.0"):
+                ifaces_def.add(p[0])
+        for p in filas:  # 2ª pasada: subred directa de esas interfaces
+            if len(p) < 8 or p[0] not in ifaces_def:
+                continue
+            dest, gw, mask = _hex_ip(p[1]), _hex_ip(p[2]), _hex_ip(p[7])
+            if gw == "0.0.0.0" and dest not in (None, "0.0.0.0") and mask not in (None, "0.0.0.0"):
+                subs.append((dest, mask))
+
+    def en_sub(ip, red, mask):
+        try:
+            return ipaddress.ip_address(ip) in ipaddress.ip_network(
+                f"{red}/{mask}", strict=False)
+        except ValueError:
+            return False
+
+    ips, cand = [], None
+    f = _abrir_proc1("net/fib_trie")
+    if f:
+        with f:
+            for linea in f:  # direcciones propias: '/32 link LOCAL'
+                linea = linea.strip()
+                if linea.startswith("|--"):
+                    cand = linea[3:].strip()
+                elif cand is not None and "/32" in linea and "LOCAL" in linea:
+                    if (cand not in ips and not cand.startswith("127.")
+                            and not cand.startswith("169.254.")):
+                        ips.append(cand)
+                    cand = None
+                else:
+                    cand = None
+    en_lan = [ip for ip in ips if any(en_sub(ip, d, m) for d, m in subs)]
+    return en_lan or ips
 
 
 def uptime_secs():
@@ -628,17 +718,21 @@ def disk_section():
 
 
 def net_counters():
+    """Bytes RX/TX acumulados por interfaz del HOST (el /proc del PID 1)."""
     out = {}
-    try:
-        with open("/proc/net/dev") as f:
-            for line in f.readlines()[2:]:
-                if ":" not in line:
-                    continue
-                name, rest = line.split(":", 1)
-                c = rest.split()
+    f = _abrir_proc1("net/dev")
+    if not f:
+        return out
+    with f:
+        for line in f.readlines()[2:]:
+            if ":" not in line:
+                continue
+            name, rest = line.split(":", 1)
+            c = rest.split()
+            try:
                 out[name.strip()] = (int(c[0]), int(c[8]))
-    except (OSError, ValueError, IndexError):
-        return {}
+            except (ValueError, IndexError):
+                continue
     return out
 
 
@@ -694,7 +788,7 @@ def build_report(temps):
     """(cabecera, desc, secciones) del informe periódico detallado."""
     cpu, cores, top_cpu, top_ram, nproc = sample_cpu(1.0)
     l1, l5, l15 = os.getloadavg()
-    desc = f"IP privada: `{local_ip() or 'sin red'}`"
+    desc = f"IP privada: `{', '.join(host_ips()) or 'sin red'}`"
 
     secs = [("Equipo", equipo_section())]
 
@@ -731,7 +825,7 @@ def build_boot(kind):
     secs = [("Equipo", equipo_section() + f"\nCPU: {cpu_model() or '?'} ({NCPU} núcleos)"),
             ("Docker", docker_head())]
     return (f"🖥️ {HOST} iniciado ({kind})",
-            f"IP privada: `{local_ip() or 'sin red'}`", secs)
+            f"IP privada: `{', '.join(host_ips()) or 'sin red'}`", secs)
 
 
 def build_ip_change(old, new):
@@ -852,7 +946,7 @@ def main():
 
         # --- IP en arranque (reintenta hasta que haya red y Discord responda)
         if boot_pending and now >= next_boot_try:
-            ip = local_ip()
+            ip = ", ".join(host_ips())
             ok = False
             if ip:
                 kind = "arranque del equipo" if uptime_secs() < 300 else "reinicio del servicio"
@@ -869,7 +963,7 @@ def main():
         # --- cambio de IP privada mientras está encendido
         elif not boot_pending and now >= next_ip_check:
             next_ip_check = now + 60
-            ip = local_ip()
+            ip = ", ".join(host_ips())
             if ip and ip != last_ip:
                 if send_out(REPORT_CHANNEL, *build_ip_change(last_ip, ip)):
                     last_ip = ip

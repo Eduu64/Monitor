@@ -834,10 +834,26 @@ def build_report(temps):
     return f"📊 {HOST} — informe periódico", desc, secs
 
 
-def build_boot(kind):
-    """(cabecera, desc, secciones) del mensaje de arranque."""
-    secs = [("Equipo", equipo_section() + f"\nCPU: {cpu_model() or '?'} ({NCPU} núcleos)"),
-            ("Docker", docker_head())]
+def build_boot(kind, temps=None):
+    """(cabecera, desc, secciones) del mensaje de arranque.
+
+    Resumen completo del equipo al arrancar: temperaturas, equipo (uptime,
+    distro/kernel, carga, modelo de CPU), memoria, discos y la ficha detallada
+    de cada contenedor (estado, imagen, CPU/RAM y reinicios). Con solo este
+    mensaje ves si el stack y el resto de contenedores quedaron bien tras un
+    reinicio, sin esperar al informe periódico.
+    """
+    if temps is None:
+        temps = read_temps()
+    secs = [("Temperaturas", fmt_temps(temps)),
+            ("Equipo", equipo_section() + f"\nCPU: {cpu_model() or '?'} ({NCPU} núcleos)"),
+            ("Memoria", mem_section()),
+            ("Discos", disk_section())]
+    try:
+        head, lines = docker_section()
+        secs.append(("Docker", head + ("\n" + "\n".join(lines) if lines else "")))
+    except Exception as e:
+        secs.append(("Docker", f"no accesible ({e})"))
     return (f"🖥️ {HOST} iniciado ({kind})",
             f"IP privada: `{', '.join(host_ips()) or 'sin red'}`", secs)
 
@@ -965,7 +981,7 @@ def main():
             if ip:
                 kind = "arranque del equipo" if uptime_secs() < 300 else "reinicio del servicio"
                 try:
-                    ok = send_out(REPORT_CHANNEL, *build_boot(kind))
+                    ok = send_out(REPORT_CHANNEL, *build_boot(kind, temps))
                 except Exception as e:
                     log(f"Error en el mensaje de arranque: {e}")
             if ok:

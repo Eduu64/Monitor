@@ -290,9 +290,11 @@ docker compose logs -f proxy
 
 ## 📨 Qué mensajes envía
 
-- **Arranque** (informes): modelo de CPU, uptime, distro/kernel, RAM, Docker, IP privada.
-  Se reintenta cada 10 s hasta que sale, así que en un reinicio del equipo te
-  llega en cuanto hay red: es la confirmación de que el stack se levantó solo.
+- **Arranque** (informes): temperaturas, equipo (uptime, distro/kernel, carga,
+  modelo de CPU), memoria, discos y ficha de cada contenedor (estado, imagen,
+  CPU/RAM y reinicios), además de la IP privada. Se reintenta cada 10 s hasta
+  que sale, así que en un reinicio del equipo te llega en cuanto hay red: es
+  la confirmación de que el stack se levantó solo y cómo quedó todo.
 - **Cambio de IP privada** (informes): `192.168.1.10` → `192.168.1.42`. Detecta la IP
   de la interfaz con ruta por defecto leyendo ficheros del host (sin paquetes).
 - **Informe periódico** (informes): uso real de CPU y por núcleo, top de

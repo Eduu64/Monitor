@@ -32,6 +32,8 @@ Diseñado con tres reglas fijas:
 | `permitidos` | **La lista blanca de dominios**. Solo `*.discord.com`; aquí se añadiría otro servicio |
 | `docker-compose.yml` | Los dos contenedores, la red interna sin salida y todo el endurecimiento |
 | `.env.example.txt` | Plantilla de configuración → copiar a `.env` y rellenar |
+| `docker-restart-all.service` | **Opcional, para el host**: unidad de systemd que al arrancar hace un reinicio real (`docker restart`) de los contenedores que estén en marcha |
+| `docker-restart-all.sh` | Script que ejecuta la unidad anterior; las exclusiones (`EXCLUIR`) y la espera (`ESPERA`) se ajustan aquí |
 
 ---
 
@@ -152,6 +154,43 @@ Ya está implementado, no hay que instalar nada más:
   que todo el stack (red interna, proxy y salida a Discord) está operativo.
 - El proxy arranca en menos de un segundo y pasa el healthcheck antes de que
   el monitor empiece a enviar.
+
+### Extra opcional: reinicio REAL de todos los contenedores al arrancar
+
+`restart: unless-stopped` solo **levanta** los contenedores; no los
+**reinicia**. Si algún otro stack tuyo arranca mejor con un ciclo limpio
+(`docker restart`) después de encender el equipo, este proyecto trae una
+unidad de systemd que lo hace por ti:
+
+- Espera a que el daemon de Docker responda (máx. 120 s) + un margen de 10 s
+  para que Docker termine de auto-arrancar los suyos.
+- Reinicia **los contenedores en marcha**; los parados no se tocan (respeta
+  quien paró algo a propósito).
+- **Excluye este stack** (`pcmonitor` y `pcmonitor-proxy`): ya arranca solo y
+  reiniciarlo enviaría el mensaje de arranque dos veces a Discord.
+
+Instalación (una sola vez):
+
+```bash
+cd /opt/pcmonitor
+sudo cp docker-restart-all.sh /usr/local/bin/
+sudo chmod +x /usr/local/bin/docker-restart-all.sh
+sudo cp docker-restart-all.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable docker-restart-all
+```
+
+Probarlo a mano ahora mismo (sin esperar a un reinicio del equipo):
+
+```bash
+sudo systemctl start docker-restart-all
+journalctl -u docker-restart-all -n 30   # qué saltó, qué reinició
+```
+
+Ajustes: edita `/usr/local/bin/docker-restart-all.sh` → `EXCLUIR` (nombres
+que no se reinician; déjalo vacío con `EXCLUIR=""` para reiniciar también
+este stack) y `ESPERA` (margen tras detectar el daemon). Tras editarlo, no
+hay que recargar nada: la unidad llama al script en cada arranque.
 
 ---
 

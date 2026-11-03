@@ -1,0 +1,45 @@
+# ============================================================================
+#  docker-restart-all.service — REINICIA los contenedores Docker al arrancar
+# ============================================================================
+#  A diferencia de `restart: unless-stopped` (que solo LOS LEVANTA solos),
+#  esto hace un reinicio real (`docker restart`) de los contenedores que
+#  estén en marcha una vez el daemon de Docker responde. Pensado para stacks
+#  que arrancan mejor con un ciclo limpio tras encender el equipo.
+#
+#  INSTALACIÓN (una sola vez):
+#    sudo cp docker-restart-all.sh /usr/local/bin/
+#    sudo chmod +x /usr/local/bin/docker-restart-all.sh
+#    sudo cp docker-restart-all.service /etc/systemd/system/
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable docker-restart-all
+#
+#  PROBARLO A MANO (reinicia los contenedores en marcha ahora mismo):
+#    sudo systemctl start docker-restart-all
+#    journalctl -u docker-restart-all -n 30        # ver qué hizo
+#
+#  QUITARLO:
+#    sudo systemctl disable docker-restart-all
+#    sudo rm /etc/systemd/system/docker-restart-all.service \
+#            /usr/local/bin/docker-restart-all.sh
+#    sudo systemctl daemon-reload
+# ============================================================================
+#  Exclusiones y tiempo de espera: se editan dentro de docker-restart-all.sh
+#  (variables EXCLUIR y ESPERA).
+# ============================================================================
+
+[Unit]
+Description=Reinicio de los contenedores Docker en marcha, tras el arranque
+Documentation=man:docker(1)
+After=docker.service docker.socket
+Requires=docker.service
+ConditionPathExists=/usr/bin/docker
+
+[Service]
+Type=oneshot
+TimeoutStartSec=180
+ExecStart=/usr/local/bin/docker-restart-all.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

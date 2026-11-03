@@ -21,3 +21,9 @@
 # Discord (API REST del bot: mensajes, canales, webhooks)
 ^discord\.com$
 \.discord\.com$
+
+# Estadísticas internas del propio proxy (la usa el healthcheck del
+# contenedor). Nunca sale a internet: tinyproxy intercepta este nombre
+# y responde él mismo con su página de estado. Sin esta línea el
+# healthcheck recibiría 403 y el contenedor nunca llegaría a "healthy".
+^tinyproxy\.stats$

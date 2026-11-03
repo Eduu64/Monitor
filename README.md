@@ -362,8 +362,10 @@ ambos sitios).
 | Síntoma | Causa probable | Qué mirar |
 |---|---|---|
 | No aparece nada en Discord | Token/canales mal puestos, o el bot no está en el servidor | `docker compose logs pcmonitor` |
+| El proxy no arranca: `Syntax error on line N` en sus logs | Tinyproxy **no admite comentarios al final de línea** en su config | Comentarios siempre en línea propia (formato de `tinyproxy.conf`) |
+| El proxy arranca pero nunca pasa a `(healthy)` | Falta `^tinyproxy\.stats$` en `permitidos`: el healthcheck recibe 403 | Restaurar esa línea en `permitidos` y `docker compose up -d --build proxy` |
+| `dependency failed to start` al hacer `up` | Lo anterior: el monitor no arranca si el proxy está caído o unhealthy | `docker compose logs proxy` para ver el motivo real |
 | Las alertas no mencionan | Falta `DISCORD_USER_ID` o el bot no puede mencionarte | Revisa `.env` |
-| El monitor no arranca (`dependency failed to start`) | El proxy no pasa el healthcheck | `docker compose logs proxy` |
 | `403` en los logs del proxy | Un dominio no permitido (normal si no es Discord) | Es el filtro funcionando |
 | `Pool overlaps with other one on this address space` | La subred interna ya la usa otra red Docker | Cambiarla en compose + `tinyproxy.conf` |
 | Sin temperaturas | El equipo no expone sensores en `/sys/class/thermal` ni `hwmon` | Comprueba con `sensors` (lm-sensors) |

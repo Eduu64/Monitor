@@ -1,0 +1,23 @@
+# ============================================================================
+#  Lista blanca de dominios del proxy (Tinyproxy + FilterDefaultDeny Yes)
+# ============================================================================
+#  Todo lo que NO case aquí queda bloqueado con 403. Este fichero es la
+#  puerta de salida completa del monitor: lo que no esté listado, no existe.
+#
+#  Cada línea es una regex POSIX sobre el dominio (sin puerto, sin https://,
+#  sin barra final). Ojo: la regex se BUSCA dentro del texto, así que
+#  "discord.com" a pelo también dejaría pasar "midiscord.com" o
+#  "discord.com.malicioso.net". Por eso cada servicio se pone con anclas:
+#
+#    ^ejemplo\.com$     → el dominio exacto
+#    \.ejemplo\.com$    → cualquier subdominio (algo.ejemplo.com)
+#
+#  (el punto se escapa con \ para que sea un punto literal)
+#
+#  Para permitir otro servicio, añade sus dos líneas y aplica con:
+#     docker compose restart proxy
+# ============================================================================
+
+# Discord (API REST del bot: mensajes, canales, webhooks)
+^discord\.com$
+\.discord\.com$

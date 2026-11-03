@@ -17,8 +17,8 @@ Canal de ALERTAS (con notificación), embeds con color:
 No consulta ningún servicio externo: todo se lee del propio equipo (/proc,
 /sys, el socket de Docker y el /proc del PID 1 del host para la red). Lo
 único que sale son los mensajes a Discord, y solo pueden salir por el proxy
-interno del compose (HTTPS_PROXY → squid con lista de dominios). Solo usa
-la librería estándar.
+interno del compose (HTTPS_PROXY → Tinyproxy con lista blanca de dominios).
+Solo usa la librería estándar.
 """
 import glob
 import http.client
@@ -85,9 +85,9 @@ HEADERS = {
     "User-Agent": "DiscordBot (https://localhost, 1.0)",
 }
 
-# Salida HTTP solo por el proxy de egreso (compose: squid interno que filtra
-# por dominio). Sin HTTPS_PROXY funciona normal, útil si lo ejecutas directo
-# en Debian en vez de en Docker.
+# Salida HTTP solo por el proxy de egreso (compose: Tinyproxy interno que
+# filtra por dominio). Sin HTTPS_PROXY funciona normal, útil si lo ejecutas
+# directo en Debian en vez de en Docker.
 PROXY = os.getenv("HTTPS_PROXY", "")
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler(
     {"https": PROXY} if PROXY else None))
@@ -370,23 +370,36 @@ def ct_inspect(cid):
 
 
 def ct_stats(cid):
-    """(cpu%, ram) de un contenedor en marcha, con una lectura puntual de stats."""
+    """(cpu%, RAM, % de su límite de RAM) de un contenedor en marcha."""
     try:
         c = _UnixConn(DOCKER_SOCK)
         c.request("GET", f"/containers/{cid}/stats?stream=false")
         s = json.load(c.getresponse())
         c.close()
     except Exception:
-        return None, None
+        return None, None, None
+    return _parse_stats(s)
+
+
+def _parse_stats(s):
+    """Traduce el JSON de /stats a (cpu%, RAM usada, % sobre su límite).
+
+    La CPU se calcula como en 'docker stats' (delta de ticks del
+    contenedor / delta del sistema × núcleos). La RAM descarta la caché
+    de páginas: cgroup v2 la llama inactive_file y el v1 cache.
+    """
     try:
         cpu_d = s["cpu_stats"]["cpu_usage"]["total_usage"] - s["precpu_stats"]["cpu_usage"]["total_usage"]
         sys_d = s["cpu_stats"]["system_cpu_usage"] - s["precpu_stats"]["system_cpu_usage"]
         ncpu = s["cpu_stats"].get("online_cpus") or len(s["cpu_stats"]["cpu_usage"].get("percpu_usage") or []) or 1
         cpu = max(0.0, cpu_d / sys_d * ncpu * 100) if sys_d > 0 and cpu_d > 0 else 0.0
-        mem = s["memory_stats"].get("usage", 0) - s["memory_stats"].get("stats", {}).get("cache", 0)
-        return cpu, max(mem, 0)
+        st = s["memory_stats"].get("stats", {})
+        mem = max(s["memory_stats"].get("usage", 0) - st.get("inactive_file", st.get("cache", 0)), 0)
+        lim = s["memory_stats"].get("limit", 0)
+        pct = min(int(mem * 100 / lim), 100) if lim > 0 and mem > 0 else None
+        return cpu, mem, pct
     except (KeyError, TypeError, ZeroDivisionError):
-        return None, None
+        return None, None, None
 
 
 def docker_head():
@@ -417,9 +430,10 @@ def docker_section():
         if img:
             line += f"\n      imagen: {img}"
         if st == "running" and DOCKER_STATS:
-            cpu, ram = ct_stats(ct["Id"])
+            cpu, ram, pct = ct_stats(ct["Id"])
             if cpu is not None:
-                line += f"\n      CPU {cpu:.0f}% · RAM {fmt_size(ram)}"
+                extra = f" ({pct}% del límite)" if pct is not None else ""
+                line += f"\n      CPU {cpu:.0f}% · RAM {fmt_size(ram)}{extra}"
         if DOCKER_STATS:
             ins = ct_inspect(ct["Id"])
             if ins and ins.get("RestartCount"):

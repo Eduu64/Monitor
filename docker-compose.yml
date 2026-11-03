@@ -2,16 +2,26 @@
 #  Monitor de PC — avisos en Discord con salida de red RESTRINGIDA
 # ============================================================================
 #  El contenedor del monitor NO tiene internet: vive en una red interna de
-#  Docker (internal: true) y su única vía de salida es un proxy Squid que
-#  solo deja pasar HTTPS hacia *.discord.com (ver squid.conf). El proxy no
-#  publica ningún puerto: solo lo alcanza el monitor por la red interna.
+#  Docker (internal: true) y su única vía de salida es un proxy Tinyproxy
+#  (Alpine, ~10 MB) que solo deja pasar HTTPS hacia los dominios de la lista
+#  "permitidos". NINGUNO de los dos contenedores publica puertos en el host:
+#  no choca con otros stacks que ya usen el 3128, el 3000 o el que sea.
+#
+#  La subred interna (10.213.101.0/24) está elegida FUERA del rango que
+#  Docker asigna automáticamente (172.16-172.31.x y 192.168.x) para no chocar
+#  con redes de otros stacks ya existentes.
+#
+#  Arranque automático: con `restart: unless-stopped` ambos contenedores se
+#  levantan solos al encender el servidor, siempre que Docker esté habilitado
+#  (en Debian, por defecto lo está: sudo systemctl enable docker). El monitor
+#  reintenta el mensaje de arranque cada 10 s hasta que Discord responde.
 # ============================================================================
 
 services:
   pcmonitor:
     build: .
     container_name: pcmonitor
-    restart: unless-stopped        # arranca solo con el equipo
+    restart: unless-stopped        # se levanta solo, también al arrancar el equipo
     pid: host                      # temperaturas y procesos del host + apagado térmico
     security_opt:
       - apparmor=unconfined        # el perfil por defecto bloquea señales al PID 1 del host
@@ -24,6 +34,7 @@ services:
     environment:
       # Única vía de salida: el proxy interno (solo *.discord.com:443)
       - HTTPS_PROXY=http://proxy:3128
+      - TZ=Europe/Madrid           # horas locales en los mensajes
       - PYTHONDONTWRITEBYTECODE=1
     env_file: .env
     depends_on:
@@ -31,9 +42,10 @@ services:
         condition: service_healthy
     networks: [monitor]
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock   # estado de contenedores
+      - /var/run/docker.sock:/var/run/docker.sock   # estado y recursos de contenedores
       - /:/host:ro                                  # discos reales, distro, fstab y /proc del host
     mem_limit: 64m
+    pids_limit: 100
     logging:
       driver: json-file
       options:
@@ -41,8 +53,9 @@ services:
         max-file: "2"
 
   # ------------------------------------------------------------------
-  #  Proxy de salida (Squid): el ÚNICO contenedor con internet. Solo
-  #  acepta al monitor y solo deja pasar HTTPS a los dominios de Discord.
+  #  Proxy de salida (Tinyproxy sobre Alpine): el ÚNICO con internet.
+  #  Solo acepta al monitor y solo deja pasar HTTPS a los dominios de
+  #  la lista "permitidos". Sin puertos publicados en el host.
   # ------------------------------------------------------------------
   proxy:
     build:
@@ -50,23 +63,27 @@ services:
       dockerfile: Dockerfile.proxy
     container_name: pcmonitor-proxy
     restart: unless-stopped
+    init: true                     # tini como PID 1: reenvía señales y recoge zombis
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
-    cap_add: [CHOWN, SETGID, SETUID, DAC_OVERRIDE]  # lo mínimo para bajar al usuario "proxy"
+    cap_add: [SETGID, SETUID]      # solo lo justo para bajar al usuario "nobody"
     read_only: true
     tmpfs:
-      - /tmp:size=32m,mode=1777
-      - /var/log/squid:size=16m,mode=0755,uid=13,gid=13
-      - /var/spool/squid:size=32m,mode=0755,uid=13,gid=13
+      - /tmp:size=8m,mode=1777
+      - /run:size=8m,mode=0755
     networks: [monitor, salida]
-    mem_limit: 128m
+    mem_limit: 32m
+    pids_limit: 50
     healthcheck:
-      test: ["CMD-SHELL", "timeout 4 bash -c '</dev/tcp/127.0.0.1/3128'"]
+      # Le pregunta su página de estadísticas interna (tinyproxy.stats) a
+      # través del propio proxy: si responde "HTTP/... 200" está vivo y
+      # hablando HTTP. Usa solo busybox (nc/printf/grep), sin instalar nada.
+      test: ["CMD-SHELL", "printf 'GET http://tinyproxy.stats/ HTTP/1.0\\r\\nHost: tinyproxy.stats\\r\\n\\r\\n' | nc 127.0.0.1 3128 | head -n1 | grep -q ' 200 '"]
       interval: 30s
       timeout: 6s
       retries: 3
-      start_period: 15s
+      start_period: 10s
     logging:
       driver: json-file
       options:
@@ -75,9 +92,9 @@ services:
 
 # ---------------------------------------------------------------------------
 #  monitor : red aislada SIN salida a internet (internal: true).
-#            Subred fija: squid.conf solo admite clientes de 172.30.101.0/24.
-#            Si esta subred choca con tu red o con otras redes Docker, cámbiala
-#            AQUÍ y en la ACL "cliente" de squid.conf (misma en ambos sitios).
+#            Subred fija fuera del rango automático de Docker; el `Allow`
+#            de tinyproxy.conf debe coincidir. Si hay que cambiarla,
+#            hacerlo en AMBOS ficheros.
 #  salida  : bridge normal con internet; solo lo usa el proxy.
 # ---------------------------------------------------------------------------
 networks:
@@ -85,5 +102,5 @@ networks:
     internal: true
     ipam:
       config:
-        - subnet: 172.30.101.0/24
+        - subnet: 10.213.101.0/24
   salida: {}
